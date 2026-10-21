@@ -20,13 +20,6 @@ jobs:
         ndk-version: r25c
         add-to-path: true
 
-    - name: Debug - list files
-      run: |
-        echo "=== Workspace contents ==="
-        ls -la ${{ github.workspace }}
-        echo "=== Looking for Android.mk ==="
-        find ${{ github.workspace }} -name "Android.mk" -type f
-
     - name: Build with ndk-build
       run: |
         cd ${{ github.workspace }}
