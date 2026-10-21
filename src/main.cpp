@@ -10,15 +10,13 @@
 #include <sys/uio.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
-#include <sys/ptrace.h>
-#include <sys/wait.h>
 #include <dirent.h>
 #include <string>
 #include <vector>
 #include <android/log.h>
 #include <android/dlext.h>
-#include <elf.h>
-#include <sys/user.h>
+
+#include "shellcode.h"
 
 #define LOG_TAG "PVMInjector"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -93,69 +91,95 @@ static bool process_vm_write(int pid, uintptr_t addr, const void* data, size_t l
     return n == (ssize_t)len;
 }
 
-static bool inject_via_ptrace(int pid, const char* lib_path, uintptr_t dlopen_addr) {
-    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
-        LOGE("PTRACE_ATTACH failed: %s", strerror(errno));
-        return false;
-    }
-    int status;
-    if (waitpid(pid, &status, 0) < 0) {
-        LOGE("waitpid failed");
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+static uintptr_t get_remote_pc(int pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/syscall", pid);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return 0;
+    long long pc = 0;
+    if (fscanf(fp, "%*d %*d %lld", &pc) != 1) pc = 0;
+    fclose(fp);
+    return (uintptr_t)pc;
+}
+
+static bool inject_library(int pid, const char* lib_path) {
+    int fd = open(lib_path, O_RDONLY);
+    if (fd < 0) {
+        LOGE("Cannot open %s: %s", lib_path, strerror(errno));
         return false;
     }
 
-    struct user_pt_regs regs;
-    struct iovec iov = { &regs, sizeof(regs) };
-    if (ptrace(PTRACE_GETREGSET, pid, (void*)NT_PRSTATUS, &iov) < 0) {
-        LOGE("PTRACE_GETREGSET failed: %s", strerror(errno));
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    struct stat st;
+    fstat(fd, &st);
+    if (st.st_size <= 0 || st.st_size > 64 * 1024 * 1024) {
+        close(fd);
         return false;
     }
-    struct user_pt_regs saved_regs = regs;
 
-    uintptr_t sp = regs.sp;
-    uintptr_t path_addr = sp - 0x1000;
+    std::vector<uint8_t> lib_data(st.st_size);
+    ssize_t total = 0;
+    while (total < st.st_size) {
+        ssize_t n = read(fd, lib_data.data() + total, st.st_size - total);
+        if (n <= 0) { close(fd); return false; }
+        total += n;
+    }
+    close(fd);
+
+    uintptr_t dlopen_addr = get_remote_symbol(pid, "libdl.so", "dlopen");
+    uintptr_t restore_addr = get_remote_pc(pid);
+
+    if (!dlopen_addr) {
+        LOGE("Cannot resolve remote dlopen");
+        return false;
+    }
+    if (!restore_addr) {
+        LOGE("Cannot get remote PC");
+        return false;
+    }
+
+    LOGI("Remote dlopen: 0x%lx", (unsigned long)dlopen_addr);
+    LOGI("Remote PC: 0x%lx", (unsigned long)restore_addr);
+
+    uintptr_t memfd_addr = restore_addr + 0x1000;
+    uintptr_t shellcode_addr = restore_addr + 0x2000;
+    uintptr_t path_addr = restore_addr + 0x3000;
+    uintptr_t result_addr = restore_addr + 0x4000;
+
+    uint8_t original_code[64];
+    struct iovec local_read = { original_code, sizeof(original_code) };
+    struct iovec remote_read = { reinterpret_cast<void*>(restore_addr), sizeof(original_code) };
+    if (process_vm_readv(pid, &local_read, 1, &remote_read, 1, 0) != sizeof(original_code)) {
+        LOGE("Cannot read original code");
+        return false;
+    }
+
+    ShellcodeContext ctx = {
+        dlopen_addr,
+        dlopen_addr,
+        restore_addr,
+        path_addr,
+        result_addr
+    };
+
+    uint8_t shellcode_buf[512];
+    build_shellcode(shellcode_buf, ctx);
+
+    if (!process_vm_write(pid, shellcode_addr, shellcode_buf, sizeof(shellcode_buf))) {
+        LOGE("Cannot write shellcode");
+        return false;
+    }
 
     if (!process_vm_write(pid, path_addr, lib_path, strlen(lib_path) + 1)) {
-        LOGE("Cannot write path to remote memory");
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        LOGE("Cannot write path");
         return false;
     }
 
-    regs.regs[0] = path_addr;
-    regs.regs[1] = RTLD_NOW;
-    regs.pc = dlopen_addr;
-    regs.regs[30] = 0;
-
-    iov.iov_base = &regs;
-    iov.iov_len = sizeof(regs);
-    if (ptrace(PTRACE_SETREGSET, pid, (void*)NT_PRSTATUS, &iov) < 0) {
-        LOGE("PTRACE_SETREGSET failed: %s", strerror(errno));
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    if (!process_vm_write(pid, restore_addr, shellcode_buf, 32)) {
+        LOGE("Cannot write shellcode to PC");
         return false;
     }
 
-    if (ptrace(PTRACE_CONT, pid, NULL, NULL) < 0) {
-        LOGE("PTRACE_CONT failed");
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
-        return false;
-    }
-
-    int sig = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        LOGE("waitpid after cont failed");
-    } else if (WIFSTOPPED(status)) {
-        sig = WSTOPSIG(status);
-        LOGI("Process stopped with signal %d", sig);
-    }
-
-    iov.iov_base = &saved_regs;
-    iov.iov_len = sizeof(saved_regs);
-    ptrace(PTRACE_SETREGSET, pid, (void*)NT_PRSTATUS, &iov);
-
-    ptrace(PTRACE_DETACH, pid, NULL, NULL);
-    LOGI("Detached from process");
+    LOGI("Shellcode injected, waiting for execution...");
     return true;
 }
 
@@ -179,14 +203,7 @@ int main(int argc, char* argv[]) {
 
     LOGI("Found PID: %d", pid);
 
-    uintptr_t dlopen_addr = get_remote_symbol(pid, "libdl.so", "dlopen");
-    if (!dlopen_addr) {
-        LOGE("Cannot resolve remote dlopen");
-        return 1;
-    }
-    LOGI("Remote dlopen: 0x%lx", (unsigned long)dlopen_addr);
-
-    if (!inject_via_ptrace(pid, lib_path, dlopen_addr)) {
+    if (!inject_library(pid, lib_path)) {
         LOGE("Injection failed");
         return 1;
     }
